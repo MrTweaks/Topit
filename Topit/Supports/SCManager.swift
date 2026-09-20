@@ -8,17 +8,73 @@
 import SwiftUI
 import ScreenCaptureKit
 
+enum CaptureFrameRate: Int, CaseIterable {
+    case adaptive = 10
+    case standard = 30
+    case high = 60
+    case ultra = 120
+    case noLimit = 65535
+
+    static func migrated(_ stored: Int) -> CaptureFrameRate {
+        // A missing value now defaults to 30 Hz. Existing values remain valid,
+        // including the historical 65535 sentinel for No Limit.
+        CaptureFrameRate(rawValue: stored) ?? .standard
+    }
+
+    func frameInterval(displayMaximum: Int) -> CMTime? {
+        guard self != .noLimit else { return nil }
+        return CMTime(value: 1, timescale: CMTimeScale(min(rawValue, max(1, displayMaximum))))
+    }
+}
+
+enum CaptureQuality: Int, CaseIterable {
+    case conservative = 2560
+    case balanced = 3840
+    case native = 0
+
+    func dimensions(pointWidth: CGFloat, pointHeight: CGFloat, scale: CGFloat) -> (width: Int, height: Int) {
+        let nativeWidth = max(1, Int((pointWidth * scale).rounded()))
+        let nativeHeight = max(1, Int((pointHeight * scale).rounded()))
+        guard rawValue > 0, max(nativeWidth, nativeHeight) > rawValue else { return (nativeWidth, nativeHeight) }
+        let factor = CGFloat(rawValue) / CGFloat(max(nativeWidth, nativeHeight))
+        return (max(1, Int((CGFloat(nativeWidth) * factor).rounded())), max(1, Int((CGFloat(nativeHeight) * factor).rounded())))
+    }
+}
+
+struct CaptureDiagnostics: Equatable {
+    var activePins = 0
+    var width = 0
+    var height = 0
+    var fps = 0
+    var queueDepth = 3
+
+    var rawFrameBytes: Int { width * height * 4 }
+}
+
+struct CapturePolicy {
+    static let queueDepth = 3
+    static let defaultQuality = CaptureQuality.conservative
+
+    static func configuration(frameRate: CaptureFrameRate, quality: CaptureQuality,
+                              pointSize: CGSize, scale: CGFloat, displayMaximum: Int) -> (width: Int, height: Int, interval: CMTime?) {
+        let dimensions = quality.dimensions(pointWidth: pointSize.width, pointHeight: pointSize.height, scale: scale)
+        return (dimensions.width, dimensions.height, frameRate.frameInterval(displayMaximum: displayMaximum))
+    }
+}
+
 class AvoidManager: ObservableObject {
     static let shared = AvoidManager()
     @Published var activedFrame: CGRect = .zero
 }
 
 class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStreamOutput {
-    @AppStorage("maxFps") private var maxFps: Int = 65535
+    @AppStorage("maxFps") private var maxFps: Int = CaptureFrameRate.standard.rawValue
+    @AppStorage("captureQuality") private var captureQuality: Int = CapturePolicy.defaultQuality.rawValue
     
     @Published var videoLayer: AVSampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
     @Published var capturError: Bool = false
     @Published var capturing: Bool = false
+    @Published private(set) var diagnostics = CaptureDiagnostics()
     private var stream: SCStream?
     private var configuration: SCStreamConfiguration = SCStreamConfiguration()
     private var filter: SCContentFilter!
@@ -42,24 +98,45 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
     
     func startCapture(display: SCDisplay, window: SCWindow) async {
         if stream != nil { return }
+        guard window.frame.width > 0, window.frame.height > 0 else {
+            reportCaptureFailure("Cannot capture a window with an empty frame")
+            return
+        }
         do {
             scDisplay = display
+            // SCContentFilter must exist before reading pointPixelScale. The
+            // previous order dereferenced the IUO `filter` and trapped during
+            // the first pin operation.
+            filter = SCContentFilter(desktopIndependentWindow: window)
+            let scale = max(0.1, CGFloat(filter.pointPixelScale))
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
             configuration.colorSpaceName = CGColorSpace.sRGB
-            let frameRate = min(maxFps, display.nsScreen?.maximumFramesPerSecond ?? 60)
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(frameRate))
+            let frameRate = CaptureFrameRate.migrated(maxFps)
+            let quality = CaptureQuality(rawValue: captureQuality) ?? CapturePolicy.defaultQuality
+            let policy = CapturePolicy.configuration(frameRate: frameRate, quality: quality,
+                pointSize: window.frame.size, scale: scale,
+                displayMaximum: display.nsScreen?.maximumFramesPerSecond ?? 60)
+            if let interval = policy.interval { configuration.minimumFrameInterval = interval }
+            configuration.queueDepth = CapturePolicy.queueDepth
             configuration.showsCursor = false
             if #available (macOS 13, *) { configuration.capturesAudio = false }
 
-            filter = SCContentFilter(desktopIndependentWindow: window)
             if #available(macOS 14, *) {
-                configuration.width = Int(filter.contentRect.width) * Int(filter.pointPixelScale)
-                configuration.height = Int(filter.contentRect.height) * Int(filter.pointPixelScale)
+                configuration.width = policy.width
+                configuration.height = policy.height
             } else {
                 let pointPixelScaleOld = display.nsScreen?.backingScaleFactor ?? 2
-                configuration.width = Int(window.frame.width * pointPixelScaleOld)
-                configuration.height = Int(window.frame.height * pointPixelScaleOld)
+                let dimensions = quality.dimensions(pointWidth: window.frame.width, pointHeight: window.frame.height, scale: pointPixelScaleOld)
+            configuration.width = dimensions.width
+            configuration.height = dimensions.height
             }
+            guard configuration.width > 0, configuration.height > 0 else {
+                reportCaptureFailure("ScreenCaptureKit rejected an empty capture configuration")
+                return
+            }
+            diagnostics = CaptureDiagnostics(activePins: SCManager.pinnedWdinwows.count, width: configuration.width,
+                height: configuration.height, fps: frameRate == .noLimit ? 0 : frameRate.rawValue,
+                queueDepth: CapturePolicy.queueDepth)
             
             stream = SCStream(filter: filter, configuration: configuration, delegate: self)
             try stream?.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global())
@@ -76,6 +153,17 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
                 self.capturing = false
                 self.capturError = true
             }
+        }
+    }
+
+    private func reportCaptureFailure(_ message: String) {
+        #if DEBUG
+        print("Capture unavailable: \(message)")
+        #endif
+        DispatchQueue.main.async {
+            self.stream = nil
+            self.capturing = false
+            self.capturError = true
         }
     }
     
@@ -104,11 +192,21 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
     
     func updateStreamSize(newWidth: CGFloat, newHeight: CGFloat, screen: NSScreen? = nil) {
         let pointPixelScaleOld = screen?.backingScaleFactor ?? 2
-        configuration.width = Int(newWidth * pointPixelScaleOld)
-        configuration.height = Int(newHeight * pointPixelScaleOld)
+        let quality = CaptureQuality(rawValue: captureQuality) ?? CapturePolicy.defaultQuality
+        let dimensions = quality.dimensions(pointWidth: newWidth, pointHeight: newHeight, scale: pointPixelScaleOld)
+        configuration.width = dimensions.width
+        configuration.height = dimensions.height
+        configuration.queueDepth = CapturePolicy.queueDepth
         
-        let frameRate = min(maxFps, screen?.maximumFramesPerSecond ?? 60)
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(frameRate))
+        let configuredFrameRate = CaptureFrameRate.migrated(maxFps)
+        // Adaptive mode starts at 10 Hz and is promoted during resize/motion,
+        // which is the existing high-frequency observation path.
+        let frameRate = configuredFrameRate == .adaptive ? .high : configuredFrameRate
+        if let interval = frameRate.frameInterval(displayMaximum: screen?.maximumFramesPerSecond ?? 60) {
+            configuration.minimumFrameInterval = interval
+        }
+        diagnostics = CaptureDiagnostics(activePins: SCManager.pinnedWdinwows.count, width: dimensions.width,
+            height: dimensions.height, fps: frameRate == .noLimit ? 0 : frameRate.rawValue, queueDepth: CapturePolicy.queueDepth)
 
         stream?.updateConfiguration(configuration) { error in
             if let error = error { print("Failed to update stream configuration: \(error)") }
@@ -245,7 +343,6 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
                     }
                 }
             }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { self.streams[index].stopCapture() }
             if index + 1 == streams.count { DispatchQueue.main.async { self.isReady = true }}
         }
     }
@@ -282,6 +379,12 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
                             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .main)
                             try await stream.startCapture()
                             streams.append(stream)
+                            // Preview capture is startup work, not a set of
+                            // persistent pinned streams. Keep at most one
+                            // preview stream alive at a time so opening the
+                            // selector does not allocate N IOSurface queues.
+                            try await Task.sleep(for: .milliseconds(150))
+                            try await stopPreviewStream(stream)
                         }
                     } else {
                         for w in allWindows {
@@ -304,6 +407,15 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
                 } catch {
                     print("Get windowshot error：\(error)")
                 }
+            }
+        }
+    }
+
+    private func stopPreviewStream(_ stream: SCStream) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            stream.stopCapture { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume(returning: ()) }
             }
         }
     }
