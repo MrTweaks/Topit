@@ -331,7 +331,7 @@ struct OverlayViewOpacity: View {
     private func stopCapture() {
         if !capturing { return }
         capturing = false
-        cm.stopCapture()
+        cm.stopCapture(preservingCaptureTarget: true)
     }
     
     private func checkMouseLocation() {

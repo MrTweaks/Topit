@@ -172,12 +172,14 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         }
     }
 
-    private func releaseCaptureResources() {
+    private func releaseCaptureResources(clearCaptureTarget: Bool = true) {
         autoreleasepool {
             acceptingFrames = false
             stream = nil
-            filter = nil
-            scDisplay = nil
+            if clearCaptureTarget {
+                filter = nil
+                scDisplay = nil
+            }
             configuration = SCStreamConfiguration()
             diagnostics = CaptureDiagnostics()
             videoLayer.flushAndRemoveImage()
@@ -252,7 +254,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         }
     }
 
-    func stopCapture() {
+    func stopCapture(preservingCaptureTarget: Bool = false) {
         guard !stopping else { return }
         stopping = true
         acceptingFrames = false
@@ -266,7 +268,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         streamToStop.stopCapture { [weak self] error in
             guard let self else { return }
             DispatchQueue.main.async{
-                self.releaseCaptureResources()
+                self.releaseCaptureResources(clearCaptureTarget: !preservingCaptureTarget)
                 self.stopping = false
                 self.capturError = false
                 if let error = error {
