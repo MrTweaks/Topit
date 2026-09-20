@@ -7,6 +7,7 @@
 
 import SwiftUI
 import ScreenCaptureKit
+import Darwin
 
 enum CaptureFrameRate: Int, CaseIterable {
     case adaptive = 10
@@ -79,13 +80,16 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
     private var configuration: SCStreamConfiguration = SCStreamConfiguration()
     private var filter: SCContentFilter!
     private var scDisplay: SCDisplay!
+    private var acceptingFrames = false
+    private var stopping = false
     
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
         guard sampleBuffer.isValid else { return }
         switch outputType {
         case .screen:
             DispatchQueue.main.async { [weak self] in
-                self?.videoLayer.enqueue(sampleBuffer)
+                guard let self, self.acceptingFrames, self.stream === stream else { return }
+                self.videoLayer.enqueue(sampleBuffer)
             }
         case .audio:
             break
@@ -97,7 +101,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
     }
     
     func startCapture(display: SCDisplay, window: SCWindow) async {
-        if stream != nil { return }
+        if stream != nil || stopping { return }
         guard window.frame.width > 0, window.frame.height > 0 else {
             reportCaptureFailure("Cannot capture a window with an empty frame")
             return
@@ -119,6 +123,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
             if let interval = policy.interval { configuration.minimumFrameInterval = interval }
             configuration.queueDepth = CapturePolicy.queueDepth
             configuration.showsCursor = false
+            configuration.scalesToFit = true
             if #available (macOS 13, *) { configuration.capturesAudio = false }
 
             if #available(macOS 14, *) {
@@ -142,6 +147,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
             try stream?.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global())
             
             try await stream?.startCapture()
+            acceptingFrames = true
             DispatchQueue.main.async {
                 self.capturing = true
                 self.capturError = false
@@ -149,7 +155,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         } catch {
             print("Start capture failed with error: \(error)")
             DispatchQueue.main.async {
-                self.stream = nil
+                self.releaseCaptureResources()
                 self.capturing = false
                 self.capturError = true
             }
@@ -161,14 +167,37 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         print("Capture unavailable: \(message)")
         #endif
         DispatchQueue.main.async {
-            self.stream = nil
-            self.capturing = false
+            self.releaseCaptureResources()
             self.capturError = true
         }
     }
+
+    private func releaseCaptureResources() {
+        autoreleasepool {
+            acceptingFrames = false
+            stream = nil
+            filter = nil
+            scDisplay = nil
+            configuration = SCStreamConfiguration()
+            diagnostics = CaptureDiagnostics()
+            videoLayer.flushAndRemoveImage()
+            videoLayer.removeFromSuperlayer()
+            videoLayer = AVSampleBufferDisplayLayer()
+            capturing = false
+            CATransaction.flush()
+        }
+        // Return reclaimable allocator pages after the IOSurface/display-layer
+        // references have been dropped. This is a best-effort relief call; it
+        // does not fabricate a memory measurement or affect live allocations.
+        _ = malloc_zone_pressure_relief(nil, 0)
+    }
     
     func resumeCapture(newWidth: CGFloat, newHeight: CGFloat, screenID: CGDirectDisplayID? = nil) async {
-        if stream != nil { return }
+        if stream != nil || stopping { return }
+        guard filter != nil else {
+            reportCaptureFailure("Cannot resume capture without an active content filter")
+            return
+        }
         let screen = NSScreen.screens.first(where: { $0.displayID == screenID })
         updateStreamSize(newWidth: newWidth, newHeight: newHeight, screen: screen)
         do {
@@ -183,8 +212,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         } catch {
             print("Resume capture failed with error: \(error)")
             DispatchQueue.main.async {
-                self.stream = nil
-                self.capturing = false
+                self.releaseCaptureResources()
                 self.capturError = true
             }
         }
@@ -197,6 +225,7 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         configuration.width = dimensions.width
         configuration.height = dimensions.height
         configuration.queueDepth = CapturePolicy.queueDepth
+        configuration.scalesToFit = true
         
         let configuredFrameRate = CaptureFrameRate.migrated(maxFps)
         // Adaptive mode starts at 10 Hz and is promoted during resize/motion,
@@ -214,26 +243,36 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
     }
     
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        #if DEBUG
         print("Capture stopped with error: \(error)")
+        #endif
         DispatchQueue.main.async {
-            self.stream = nil
-            self.capturing = false
+            self.releaseCaptureResources()
             self.capturError = true
         }
     }
 
     func stopCapture() {
-        if stream == nil { return }
-        stream?.stopCapture { error in
+        guard !stopping else { return }
+        stopping = true
+        acceptingFrames = false
+        let streamToStop = stream
+        guard let streamToStop else {
+            releaseCaptureResources()
+            stopping = false
+            return
+        }
+        try? streamToStop.removeStreamOutput(self, type: .screen)
+        streamToStop.stopCapture { [weak self] error in
+            guard let self else { return }
             DispatchQueue.main.async{
-                self.stream = nil
-                self.capturing = false
+                self.releaseCaptureResources()
+                self.stopping = false
                 self.capturError = false
-                self.videoLayer.removeFromSuperlayer()
-                self.videoLayer = AVSampleBufferDisplayLayer()
                 if let error = error {
+                    #if DEBUG
                     print("Failed to stop capture: \(error)")
-                    //self.capturError = true
+                    #endif
                 }
             }
         }
