@@ -125,11 +125,13 @@ struct ContentView: View {
                                                             .foregroundStyle(.green)
                                                             .opacity(selected.contains(item.window) ? 1.0 : 0.0)
                                                             .offset(x: 55, y: 25)
-                                                        Image(nsImage: getAppIcon(item.window.owningApplication!)!)
-                                                            .resizable()
-                                                            .aspectRatio(contentMode: .fit)
-                                                            .frame(width: 40, height: 40, alignment: .center)
-                                                            .offset(y: 35)
+                                                        if let app = item.window.owningApplication, let icon = getAppIcon(app) {
+                                                            Image(nsImage: icon)
+                                                                .resizable()
+                                                                .aspectRatio(contentMode: .fit)
+                                                                .frame(width: 40, height: 40, alignment: .center)
+                                                                .offset(y: 35)
+                                                        }
                                                     }
                                                     .padding(5)
                                                     .padding([.top, .bottom], 5)
@@ -139,7 +141,7 @@ struct ContentView: View {
                                                             .cornerRadius(5)
                                                             .opacity(selected.contains(item.window) ? 0.2 : 0.0001)
                                                     )
-                                                    Text(item.window.title!)
+                                                    Text(item.window.title ?? "Untitled")
                                                         .font(.system(size: 12))
                                                         .foregroundStyle(.secondary)
                                                         .lineLimit(1)

@@ -87,10 +87,10 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
         guard sampleBuffer.isValid else { return }
         switch outputType {
         case .screen:
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.acceptingFrames, self.stream === stream else { return }
-                self.videoLayer.enqueue(sampleBuffer)
-            }
+            // Enqueue on the sample-handler queue: hopping to main retains the
+            // IOSurface past its lifetime and drops valid frames across restarts.
+            guard acceptingFrames, self.stream === stream else { return }
+            videoLayer.enqueue(sampleBuffer)
         case .audio:
             break
         case .microphone:
@@ -101,6 +101,13 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
     }
     
     func startCapture(display: SCDisplay, window: SCWindow) async {
+        // A previous async stop may still be in flight; wait briefly instead of
+        // dropping the start (dropped starts left pins black until a later tick).
+        var spins = 0
+        while stopping, spins < 20 {
+            try? await Task.sleep(for: .milliseconds(50))
+            spins += 1
+        }
         if stream != nil || stopping { return }
         guard window.frame.width > 0, window.frame.height > 0 else {
             reportCaptureFailure("Cannot capture a window with an empty frame")
@@ -195,7 +202,13 @@ class ScreenCaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStre
     }
     
     func resumeCapture(newWidth: CGFloat, newHeight: CGFloat, screenID: CGDirectDisplayID? = nil) async {
-        if stream != nil || stopping { return }
+        var spins = 0
+        while stopping, spins < 20 {
+            try? await Task.sleep(for: .milliseconds(50))
+            spins += 1
+        }
+        if stopping { return }
+        if stream != nil { return }
         guard filter != nil else {
             reportCaptureFailure("Cannot resume capture without an active content filter")
             return
@@ -351,7 +364,9 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
     @Published var isReady = false
     private var allWindows = [SCWindow]()
     private var streams = [SCStream]()
-    
+    // Shared converter: one CIContext for all thumbnails instead of one per frame.
+    private let thumbContext = CIContext(options: [.cacheIntermediates: false])
+
     override init() {
         super.init()
         //DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.setupStreams(filter: filter) }
@@ -359,15 +374,11 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
     
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // Decoded on the sample queue (background since setupStreams registers
+        // .global): a fresh CIContext per frame on main caused focus/move spikes.
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let ciContext = CIContext()
-        let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent)
-        let nsImage: NSImage
-        if let cgImage = cgImage {
-            nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        } else {
-            nsImage = NSImage.unknowScreen
-        }
+        guard let cgImage = thumbContext.createCGImage(ciImage, from: ciImage.extent) else { return }
+        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
         if let index = streams.firstIndex(of: stream), index + 1 <= allWindows.count {
             let currentWindow = allWindows[index]
             let thumbnail = WindowThumbnail(image: nsImage, window: currentWindow)
@@ -392,7 +403,15 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
         SCManager.updateAvailableContent {[self] availableContent in
             Task {
                 do {
+                    // Tear down previous preview streams before dropping them:
+                    // orphaned SCStreams keep IOSurface queues alive and grow
+                    // memory every time the selector opens or refreshes.
+                    let oldStreams = streams
                     streams.removeAll()
+                    for old in oldStreams {
+                        try? old.removeStreamOutput(self, type: .screen)
+                        try? await stopPreviewStream(old)
+                    }
                     DispatchQueue.main.async { self.windowThumbnails.removeAll() }
                     allWindows = SCManager.getWindows().filter({
                         !($0.title == "" && $0.owningApplication?.bundleIdentifier == "com.apple.finder")
@@ -417,7 +436,7 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
                             streamConfiguration.scalesToFit = true
                             streamConfiguration.queueDepth = 3
                             let stream = SCStream(filter: contentFilter, configuration: streamConfiguration, delegate: self)
-                            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .main)
+                            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global(qos: .userInitiated))
                             try await stream.startCapture()
                             streams.append(stream)
                             // Preview capture is startup work, not a set of
@@ -453,6 +472,7 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
     }
 
     private func stopPreviewStream(_ stream: SCStream) async throws {
+        try? stream.removeStreamOutput(self, type: .screen)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             stream.stopCapture { error in
                 if let error { continuation.resume(throwing: error) }
