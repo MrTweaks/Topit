@@ -166,7 +166,7 @@ struct ContentView: View {
         .padding([.horizontal, .bottom], 10)
         .padding(.top, 0.5)
         .padding(.top, isMacOS12 || isMacOS13 ? -20 : 0)
-        .background(WindowAccessor(onWindowOpen: { w in panel = w }))
+        .background(WindowAccessor(onWindowOpen: { w in panel = w }, onWindowClose: { viewModel.teardownPreviews() }))
         .onAppear { viewModel.setupStreams(filter: !noTitle) }
         .onChange(of: selectedTab) { _ in selected.removeAll() }
         .onChange(of: noTitle) { newValue in
@@ -194,7 +194,7 @@ struct ContentView: View {
             ToolbarItem(placement: .automatic) {
                 HoverButton(action: {
                     selected.removeAll()
-                    viewModel.setupStreams(filter: !noTitle)
+                    viewModel.setupStreams(filter: !noTitle, force: true)
                 }, label: {
                     Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 14, weight: .medium))
                 }).help("Update Window List")

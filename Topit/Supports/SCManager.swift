@@ -29,7 +29,9 @@ enum CaptureFrameRate: Int, CaseIterable {
 }
 
 enum CaptureQuality: Int, CaseIterable {
-    case conservative = 2560
+    // Default cap lowered 2560 -> 1920: pins render smoother with far less
+    // backing memory; Balanced/Native remain for users who want pixels.
+    case conservative = 1920
     case balanced = 3840
     case native = 0
 
@@ -366,10 +368,34 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
     private var streams = [SCStream]()
     // Shared converter: one CIContext for all thumbnails instead of one per frame.
     private let thumbContext = CIContext(options: [.cacheIntermediates: false])
+    // Throttle: focus/activate events must not re-capture (+20-50 MB a time).
+    private var lastSetup = Date.distantPast
+    private var teardownPending = false
 
     override init() {
         super.init()
         //DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.setupStreams(filter: filter) }
+    }
+
+    /// Stop every preview stream, drop outputs, purge thumbnails and return
+    /// pages. Call when the selector closes; without this, closed selectors
+    /// keep IOSurface queues + NSImages alive and memory never drops.
+    func teardownPreviews() {
+        teardownPending = true
+        let oldStreams = streams
+        streams.removeAll()
+        allWindows.removeAll()
+        Task {
+            for old in oldStreams {
+                try? old.removeStreamOutput(self, type: .screen)
+                try? await stopPreviewStream(old)
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.windowThumbnails.removeAll()
+                self?.isReady = false
+            }
+            _ = malloc_zone_pressure_relief(nil, 0)
+        }
     }
     
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -399,7 +425,15 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
         }
     }
 
-    func setupStreams(filter: Bool = false, capture: Bool = true) {
+    func setupStreams(filter: Bool = false, capture: Bool = true, force: Bool = false) {
+        // Coalesce focus/activate storms: a re-capture costs 20-50 MB and
+        // spikes CPU to 30%+. At most one setup per 3 s unless forced.
+        let now = Date()
+        if !force {
+            guard now.timeIntervalSince(lastSetup) > 3 else { return }
+        }
+        lastSetup = now
+        teardownPending = false
         SCManager.updateAvailableContent {[self] availableContent in
             Task {
                 do {
@@ -422,19 +456,23 @@ class WindowSelectorViewModel: NSObject, ObservableObject, SCStreamDelegate, SCS
                     if capture {
                         let contentFilters = allWindows.map { SCContentFilter(desktopIndependentWindow: $0) }
                         for (index, contentFilter) in contentFilters.enumerated() {
+                            if teardownPending { break }
                             let streamConfiguration = SCStreamConfiguration()
-                            let width = allWindows[index].frame.width
-                            let height = allWindows[index].frame.height
-                            var factor = 0.5
-                            if width < 200 && height < 200 { factor = 1.0 }
-                            streamConfiguration.width = Int(width * factor)
-                            streamConfiguration.height = Int(height * factor)
+                            // Thumbnails render at 160x90: capture at most 320px
+                            // wide. The old 0.5x full-window capture decoded
+                            // megabytes per window for a 160px image.
+                            let w = allWindows[index].frame.width
+                            let h = allWindows[index].frame.height
+                            let longEdge = max(1, Int(max(w, h).rounded()))
+                            let factor = min(1.0, 320.0 / CGFloat(longEdge))
+                            streamConfiguration.width = max(1, Int((w * factor).rounded()))
+                            streamConfiguration.height = max(1, Int((h * factor).rounded()))
                             streamConfiguration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(1))
                             streamConfiguration.pixelFormat = kCVPixelFormatType_32BGRA
                             if #available(macOS 13, *) { streamConfiguration.capturesAudio = false }
                             streamConfiguration.showsCursor = false
                             streamConfiguration.scalesToFit = true
-                            streamConfiguration.queueDepth = 3
+                            streamConfiguration.queueDepth = 1
                             let stream = SCStream(filter: contentFilter, configuration: streamConfiguration, delegate: self)
                             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global(qos: .userInitiated))
                             try await stream.startCapture()
